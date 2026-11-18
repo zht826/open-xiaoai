@@ -6,7 +6,6 @@ from xiaozhi.ref import (
     get_kws,
     get_speaker,
     get_vad,
-    get_xiaoai,
     get_xiaozhi,
     set_speech_frames,
 )
@@ -34,62 +33,55 @@ class __EventManager:
         if not get_env("CLI"):
             return
 
+        get_xiaozhi().loop.call_soon_threadsafe(self._update_step, step, step_data)
+
+    def _update_step(self, step: Step, step_data):
+        if step == Step.on_tts_end and self.current_step in (
+            Step.on_interrupt,
+            Step.on_tts_end,
+        ):
+            return
+
         self.current_step = step
-        if self.next_step_future:
-            get_xiaoai().async_loop.call_soon_threadsafe(
-                self.next_step_future.set_result, (step, step_data)
-            )
-            self.next_step_future = None
+        if self.next_step_future is not None and not self.next_step_future.done():
+            self.next_step_future.set_result((step, step_data))
+
+        if step in (Step.idle, Step.on_interrupt, Step.on_wakeup, Step.on_tts_end):
+            self.session_id += 1
+        if step in (Step.on_interrupt, Step.on_wakeup, Step.on_tts_end):
+            asyncio.create_task(self.__start_session(step, self.session_id))
 
     async def wait_next_step(self, timeout=None):
         current_session = self.session_id
+        future = asyncio.get_running_loop().create_future()
+        self.next_step_future = future
+        try:
+            result = await asyncio.wait_for(future, timeout)
+        except TimeoutError:
+            result = ("timeout", None)
+        finally:
+            if self.next_step_future is future:
+                self.next_step_future = None
 
-        self.next_step_future = get_xiaoai().async_loop.create_future()
-
-        async def _timeout(timeout):
-            idx = 0
-            while idx < timeout:
-                idx += 1
-                await asyncio.sleep(1)
-            return ("timeout", None)
-
-        futures = [self.next_step_future]
-
-        if timeout:
-            futures.append(get_xiaoai().async_loop.create_task(_timeout(timeout)))
-
-        done, _ = await asyncio.wait(
-            futures,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
         if current_session != self.session_id:
             # 当前 session 已经结束
             return ("interrupted", None)
-        return list(done)[0].result()
+        return result
 
     def on_interrupt(self):
         """用户打断（小爱同学）"""
-        self.session_id = self.session_id + 1
         self.update_step(Step.on_interrupt)
-        self.start_session()
 
     def on_wakeup(self):
         """用户唤醒（你好小智）"""
-        self.session_id = self.session_id + 1
         self.update_step(Step.on_wakeup)
-        self.start_session()
 
     def on_tts_end(self, session_id):
         """TTS结束"""
-        if self.current_step in [Step.on_interrupt, Step.on_tts_end]:
-            # 当前 session 已经被打断了，不再处理
-            return
-        self.session_id = self.session_id + 1
         self.update_step(Step.on_tts_end)
-        self.start_session()
 
     def on_tts_start(self, session_id):
-        """TTS结束"""
+        """TTS开始"""
         self.update_step(Step.on_tts_start)
 
     def on_speech(self, speech_buffer: bytes):
@@ -100,30 +92,44 @@ class __EventManager:
         """检测到静音（说话结束）"""
         self.update_step(Step.on_silence)
 
-    def start_session(self):
-        asyncio.run_coroutine_threadsafe(
-            self.__start_session(), get_xiaoai().async_loop
-        )
+    def on_disconnect(self):
+        self.update_step(Step.idle)
 
-    async def __start_session(self):
-        if not get_env("CLI"):
+    async def __start_session(self, trigger, session_id):
+        if session_id != self.session_id:
             return
 
+        xiaozhi = get_xiaozhi()
+        try:
+            await self._run_session(xiaozhi, trigger, session_id)
+        except ConnectionError as error:
+            if session_id == self.session_id:
+                xiaozhi.set_device_state(DeviceState.IDLE)
+            print(f"⚠️ 小智会话中断: {error}")
+
+    async def _run_session(self, xiaozhi, trigger, session_id):
         vad = get_vad()
         codec = get_audio_codec()
         speaker = get_speaker()
-        xiaozhi = get_xiaozhi()
+        protocol = xiaozhi.protocol
 
         # 先取消之前的 VAD 检测和音频输入输出流
         xiaozhi.set_device_state(DeviceState.IDLE)
-        await xiaozhi.protocol.send_abort_speaking(AbortReason.ABORT)
 
         # 小爱同学唤醒时，直接打断
-        if self.current_step == Step.on_interrupt:
+        if trigger == Step.on_interrupt:
+            if protocol.is_audio_channel_opened():
+                await protocol.send_abort_speaking(AbortReason.ABORT)
+            return
+
+        if not await protocol.open_audio_channel() or session_id != self.session_id:
+            return
+        await protocol.send_abort_speaking(AbortReason.ABORT)
+        if session_id != self.session_id:
             return
 
         # 等待 TTS 余音结束
-        if self.current_step in [Step.on_tts_end]:
+        if trigger == Step.on_tts_end:
             vad.resume("silence")
             step, _ = await self.wait_next_step()
             if step != Step.on_silence:
@@ -147,8 +153,11 @@ class __EventManager:
         # 开始说话
         set_speech_frames(speech_buffer)
         codec.input_stream.start_stream()  # 开启录音
-        await xiaozhi.protocol.send_start_listening(ListeningMode.MANUAL)
+        await protocol.send_start_listening(ListeningMode.MANUAL)
+        if session_id != self.session_id:
+            return
         xiaozhi.set_device_state(DeviceState.LISTENING)
+        print("🎙️ 小智已开始聆听")
 
         # 等待说话结束
         vad.resume("silence")
@@ -157,14 +166,21 @@ class __EventManager:
             return
 
         # 停止说话
-        await xiaozhi.protocol.send_stop_listening()
-        xiaozhi.set_device_state(DeviceState.IDLE)
+        await protocol.send_stop_listening()
+        if session_id == self.session_id:
+            xiaozhi.set_device_state(DeviceState.IDLE)
 
     async def wakeup(self, text, source):
         before_wakeup = APP_CONFIG["wakeup"]["before_wakeup"]
-        get_kws().pause()  # 暂停 KWS 检测
-        wakeup = await before_wakeup(get_speaker(), text, source)
-        get_kws().resume()  # 恢复 KWS 检测
+        kws = get_kws()
+        kws.pause()
+        try:
+            wakeup = await before_wakeup(get_speaker(), text, source)
+        except Exception as error:
+            print(f"⚠️ 小智唤醒回调失败: {error}")
+            return
+        finally:
+            kws.resume()
         if wakeup:
             self.on_wakeup()
 

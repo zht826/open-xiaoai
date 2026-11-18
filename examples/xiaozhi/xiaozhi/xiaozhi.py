@@ -89,7 +89,6 @@ class XiaoZhi:
 
         # 初始化应用程序
         asyncio.run_coroutine_threadsafe(XiaoAI.init_xiaoai(), self.loop)
-        asyncio.run_coroutine_threadsafe(self._initialize_xiaozhi(), self.loop)
 
         # 启动主循环线程
         main_loop_thread = threading.Thread(target=self._main_loop)
@@ -101,6 +100,7 @@ class XiaoZhi:
 
         # 启动 GUI
         self._initialize_display()
+        asyncio.run_coroutine_threadsafe(self._initialize_xiaozhi(), self.loop)
         self.display.start()
 
     def _run_event_loop(self):
@@ -212,15 +212,9 @@ class XiaoZhi:
 
     def _on_network_error(self, message):
         """网络错误回调"""
-        self.set_device_state(DeviceState.IDLE)
-        if self.device_state != DeviceState.CONNECTING:
+        print(f"⚠️ 小智上游连接异常: {message}")
+        if self.device_state != DeviceState.IDLE:
             self.set_device_state(DeviceState.IDLE)
-
-            # 关闭现有连接
-            if self.protocol:
-                asyncio.run_coroutine_threadsafe(
-                    self.protocol.close_audio_channel(), self.loop
-                )
 
     def _on_incoming_audio(self, data):
         """接收音频数据回调"""
@@ -312,8 +306,9 @@ class XiaoZhi:
 
     async def _on_audio_channel_closed(self):
         """音频通道关闭回调"""
-        self.set_device_state(DeviceState.IDLE)
-        self.audio_codec.stop_streams()
+        if self.running:
+            self.set_device_state(DeviceState.IDLE)
+            EventManager.on_disconnect()
 
     def set_device_state(self, state):
         """设置设备状态"""
